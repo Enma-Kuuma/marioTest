@@ -98,6 +98,238 @@
 
 <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
 <script>
+// ============ DARK AMBIENT MUSIC ENGINE ============
+var MUSIC = (function() {
+  var audioCtx = null;
+  var masterGain = null;
+  var playing = false;
+  var paused = false;
+
+  // Active nodes (for cleanup on stop)
+  var droneOscs = [];
+  var timerID = null;
+  var nextStepTime = 0;
+  var currentStep = 0;
+
+  // Very slow tempo: 55 BPM, quarter notes
+  var BPM = 55;
+  var STEP_DUR = 60 / BPM;
+
+  // Note frequencies — E Phrygian / dark minor
+  var N = {
+    E2:82, F2:87, G2:98, A2:110, B2:123, C3:131, D3:147,
+    E3:165, F3:175, G3:196, A3:220, B3:247, C4:262, D4:294,
+    E4:330, F4:349, G4:392, A4:440, B4:494, C5:523, D5:587, E5:659
+  };
+
+  // Pad chord progression — each chord is [root, third, fifth], 4 bars each = 16 steps total
+  var padChords = [
+    // Em (4 steps)
+    [N.E3, N.G3, N.B3], [N.E3, N.G3, N.B3], [N.E3, N.G3, N.B3], [N.E3, N.G3, N.B3],
+    // Bdim (4 steps)
+    [N.B3, N.D4, N.F3], [N.B3, N.D4, N.F3], [N.B3, N.D4, N.F3], [N.B3, N.D4, N.F3],
+    // Am (4 steps)
+    [N.A3, N.C4, N.E4], [N.A3, N.C4, N.E4], [N.A3, N.C4, N.E4], [N.A3, N.C4, N.E4],
+    // F → E (tension → resolve, 4 steps)
+    [N.F3, N.A3, N.C4], [N.F3, N.A3, N.C4], [N.E3, N.G3, N.B3], [N.E3, N.G3, N.B3]
+  ];
+
+  // Sparse eerie melody — mostly rests, occasional haunting notes
+  var melody = [
+    0, 0, N.B4, 0,
+    0, 0, 0, N.F4,
+    0, N.E5, 0, 0,
+    N.C5, 0, 0, 0
+  ];
+
+  var TOTAL_STEPS = padChords.length;
+
+  function getCtx() {
+    if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    if (!masterGain) {
+      masterGain = audioCtx.createGain();
+      masterGain.gain.value = 0.35;
+      masterGain.connect(audioCtx.destination);
+    }
+    return audioCtx;
+  }
+
+  function startDrone() {
+    var ac = getCtx();
+
+    // Low E2 drone — two slightly detuned sine waves for thickness
+    var osc1 = ac.createOscillator();
+    var gain1 = ac.createGain();
+    osc1.type = 'sine';
+    osc1.frequency.value = N.E2;
+    gain1.gain.value = 0.12;
+    osc1.connect(gain1);
+    gain1.connect(masterGain);
+    osc1.start();
+    droneOscs.push({ osc: osc1, gain: gain1 });
+
+    var osc2 = ac.createOscillator();
+    var gain2 = ac.createGain();
+    osc2.type = 'sine';
+    osc2.frequency.value = N.E2 * 1.003; // slight detune
+    gain2.gain.value = 0.08;
+    osc2.connect(gain2);
+    gain2.connect(masterGain);
+    osc2.start();
+    droneOscs.push({ osc: osc2, gain: gain2 });
+
+    // B2 fifth — sawtooth, very quiet, filtered feel
+    var osc3 = ac.createOscillator();
+    var gain3 = ac.createGain();
+    osc3.type = 'sawtooth';
+    osc3.frequency.value = N.B2;
+    gain3.gain.value = 0.025;
+    osc3.connect(gain3);
+    gain3.connect(masterGain);
+    osc3.start();
+    droneOscs.push({ osc: osc3, gain: gain3 });
+
+    // Sub-bass pulse — very low sine with slow LFO for pulsing feel
+    var osc4 = ac.createOscillator();
+    var gain4 = ac.createGain();
+    var lfo = ac.createOscillator();
+    var lfoGain = ac.createGain();
+    osc4.type = 'sine';
+    osc4.frequency.value = N.E2 / 2; // E1 ~41Hz, felt more than heard
+    gain4.gain.value = 0.06;
+    lfo.type = 'sine';
+    lfo.frequency.value = 0.15; // very slow pulse
+    lfoGain.gain.value = 0.03;
+    lfo.connect(lfoGain);
+    lfoGain.connect(gain4.gain);
+    osc4.connect(gain4);
+    gain4.connect(masterGain);
+    osc4.start();
+    lfo.start();
+    droneOscs.push({ osc: osc4, gain: gain4 }, { osc: lfo, gain: lfoGain });
+  }
+
+  function stopDrone() {
+    droneOscs.forEach(function(d) {
+      try { d.osc.stop(); } catch(e) {}
+      try { d.osc.disconnect(); } catch(e) {}
+      try { d.gain.disconnect(); } catch(e) {}
+    });
+    droneOscs = [];
+  }
+
+  function scheduleNote(freq, time, dur, type, vol) {
+    if (!freq || freq === 0) return;
+    var ac = getCtx();
+    var osc = ac.createOscillator();
+    var gain = ac.createGain();
+    osc.type = type || 'sine';
+    osc.frequency.value = freq;
+    // Long, haunting envelope
+    gain.gain.setValueAtTime(0.001, time);
+    gain.gain.exponentialRampToValueAtTime(vol || 0.04, time + dur * 0.15);
+    gain.gain.setValueAtTime(vol || 0.04, time + dur * 0.6);
+    gain.gain.exponentialRampToValueAtTime(0.001, time + dur);
+    osc.connect(gain);
+    gain.connect(masterGain);
+    osc.start(time);
+    osc.stop(time + dur + 0.05);
+  }
+
+  function scheduleStep(step, time) {
+    var s = step % TOTAL_STEPS;
+    var chord = padChords[s];
+
+    // Pad — slow sine chord, very quiet
+    for (var i = 0; i < chord.length; i++) {
+      scheduleNote(chord[i], time, STEP_DUR * 1.5, 'sine', 0.025);
+    }
+
+    // Sparse melody — long decay, triangle wave for hollow sound
+    var mel = melody[s];
+    if (mel) {
+      scheduleNote(mel, time + STEP_DUR * 0.25, STEP_DUR * 2.5, 'triangle', 0.035);
+    }
+
+    // Random atmospheric stab (10% chance) — dissonant high note
+    if (Math.random() < 0.1) {
+      var stabs = [N.F4, N.B4, N.C5, N.F3, N.D5];
+      var stabFreq = stabs[Math.floor(Math.random() * stabs.length)];
+      var stabDelay = Math.random() * STEP_DUR * 0.5;
+      scheduleNote(stabFreq, time + stabDelay, STEP_DUR * 3, 'sine', 0.015);
+    }
+  }
+
+  function scheduler() {
+    if (!playing || paused) return;
+    var ac = getCtx();
+    while (nextStepTime < ac.currentTime + 0.2) {
+      scheduleStep(currentStep, nextStepTime);
+      nextStepTime += STEP_DUR;
+      currentStep++;
+    }
+    timerID = setTimeout(scheduler, 50);
+  }
+
+  return {
+    start: function() {
+      if (playing) return;
+      var ac = getCtx();
+      if (ac.state === 'suspended') ac.resume();
+      playing = true;
+      paused = false;
+      currentStep = 0;
+      nextStepTime = ac.currentTime + 0.2;
+      startDrone();
+      scheduler();
+    },
+
+    stop: function() {
+      playing = false;
+      paused = false;
+      if (timerID) { clearTimeout(timerID); timerID = null; }
+      stopDrone();
+    },
+
+    pause: function() {
+      if (!playing) return;
+      paused = true;
+      if (timerID) { clearTimeout(timerID); timerID = null; }
+      // Fade drone instead of cutting
+      droneOscs.forEach(function(d) {
+        try { d.gain.gain.setTargetAtTime(0, audioCtx.currentTime, 0.3); } catch(e) {}
+      });
+    },
+
+    resume: function() {
+      if (!playing || !paused) return;
+      paused = false;
+      // Restore drone volume
+      droneOscs.forEach(function(d) {
+        try {
+          var orig = d.gain.gain.value || 0.05;
+          d.gain.gain.cancelScheduledValues(audioCtx.currentTime);
+        } catch(e) {}
+      });
+      // Restart drone cleanly
+      stopDrone();
+      startDrone();
+      var ac = getCtx();
+      nextStepTime = ac.currentTime + 0.1;
+      scheduler();
+    },
+
+    setVolume: function(v) {
+      if (masterGain) masterGain.gain.value = v;
+    },
+
+    unlock: function() {
+      var ac = getCtx();
+      if (ac.state === 'suspended') ac.resume();
+    }
+  };
+})();
+
 // ============ SCENE SETUP ============
 const scene = new THREE.Scene();
 scene.fog = new THREE.FogExp2(0x1a0515, 0.028);
@@ -764,15 +996,18 @@ function startGame() {
   state.running = true;
   document.getElementById('hud').style.display = 'block';
   document.getElementById('controls-hint').style.display = 'block';
+  MUSIC.start();
 }
 
 function gameOver() {
   state.running = false;
+  MUSIC.stop();
   document.getElementById('final-stats').textContent = `You fell after slaying ${state.kills} foes across ${state.wave} wave${state.wave > 1 ? 's' : ''}`;
   document.getElementById('game-over').classList.add('show');
 }
 
 document.getElementById('start-btn').addEventListener('click', () => {
+  MUSIC.unlock();
   document.getElementById('title-screen').classList.add('hide');
   setTimeout(() => {
     document.getElementById('title-screen').style.display = 'none';
@@ -782,6 +1017,7 @@ document.getElementById('start-btn').addEventListener('click', () => {
 
 document.getElementById('restart-btn').addEventListener('click', () => {
   document.getElementById('game-over').classList.remove('show');
+  MUSIC.stop();
   startGame();
 });
   (function() {
@@ -802,9 +1038,17 @@ document.getElementById('restart-btn').addEventListener('click', () => {
     };
 
     function togglePause() {
+      if (!state.running && !window.isGamePaused) return;
+
       window.isGamePaused = !window.isGamePaused;
       pauseMenu.style.display = window.isGamePaused ? 'flex' : 'none';
       
+      if (window.isGamePaused) {
+        MUSIC.pause();
+      } else {
+        MUSIC.resume();
+      }
+
       // Relance l'animation si on enlève la pause
       if (!window.isGamePaused && pausedCallback) {
         originalRAF(pausedCallback);

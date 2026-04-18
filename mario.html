@@ -328,6 +328,182 @@ const SFX = (() => {
 
 
 // ============================================================
+// MUSIC ENGINE (chiptune sequencer — original platformer BGM)
+// ============================================================
+var MUSIC = (function() {
+  var audioCtx = null;
+  var masterGain = null;
+  var playing = false;
+  var paused = false;
+  var timerID = null;
+  var nextStepTime = 0;
+  var currentStep = 0;
+
+  // Tempo: 155 BPM, 8th notes
+  var BPM = 155;
+  var STEP_DUR = 60 / BPM / 2; // ~0.194s per 8th note
+
+  // Note frequencies
+  var N = {
+    0:0,
+    C3:131, D3:147, E3:165, F3:175, G3:196, A3:220, Bb3:233, B3:247,
+    C4:262, D4:294, E4:330, F4:349, G4:392, A4:440, Bb4:466, B4:494,
+    C5:523, D5:587, E5:659, F5:698, G5:784, A5:880, B5:988, C6:1047
+  };
+
+  // Original melody — 64 steps (8 bars), cheerful and bouncy
+  // Section A (4 bars): ascending arpeggios + playful descents
+  // Section B (4 bars): variation with higher register + resolution
+  var melody = [
+    // Bar 1
+    N.G4, 0, N.C5, 0, N.E5, 0, N.G5, N.E5,
+    // Bar 2
+    N.F5, N.D5, N.B4, 0, N.C5, 0, 0, 0,
+    // Bar 3
+    N.A4, 0, N.C5, N.D5, N.E5, 0, N.D5, N.C5,
+    // Bar 4
+    N.B4, 0, N.D5, 0, N.G4, 0, 0, 0,
+    // Bar 5
+    N.E5, 0, N.E5, N.D5, N.C5, 0, N.A4, 0,
+    // Bar 6
+    N.G4, 0, N.A4, N.C5, N.D5, 0, 0, 0,
+    // Bar 7
+    N.C5, 0, N.E5, 0, N.G5, N.A5, N.G5, 0,
+    // Bar 8
+    N.E5, 0, N.C5, N.D5, N.C5, 0, 0, 0
+  ];
+
+  // Bass line — root notes, triangle wave feel
+  var bass = [
+    // Bar 1
+    N.C3, 0, 0, N.C3, N.G3, 0, 0, N.G3,
+    // Bar 2
+    N.F3, 0, 0, N.F3, N.C3, 0, N.G3, 0,
+    // Bar 3
+    N.A3, 0, 0, N.A3, N.E3, 0, 0, N.E3,
+    // Bar 4
+    N.G3, 0, 0, N.G3, N.G3, 0, N.D3, 0,
+    // Bar 5
+    N.C3, 0, 0, N.C3, N.F3, 0, 0, N.F3,
+    // Bar 6
+    N.G3, 0, 0, N.G3, N.G3, 0, N.B3, 0,
+    // Bar 7
+    N.A3, 0, 0, N.A3, N.F3, 0, N.E3, 0,
+    // Bar 8
+    N.C3, 0, N.G3, 0, N.C3, 0, 0, 0
+  ];
+
+  // Harmony — fills in chord tones on off-beats
+  var harmony = [
+    // Bar 1
+    0, N.E4, 0, N.G4, 0, N.C5, 0, 0,
+    // Bar 2
+    0, 0, N.G4, 0, 0, N.E4, 0, 0,
+    // Bar 3
+    0, N.C4, 0, 0, 0, N.A4, 0, 0,
+    // Bar 4
+    0, N.G4, 0, N.B4, 0, 0, 0, 0,
+    // Bar 5
+    0, N.C4, 0, 0, 0, N.E4, 0, N.C4,
+    // Bar 6
+    0, 0, N.E4, 0, 0, N.G4, 0, 0,
+    // Bar 7
+    0, N.A4, 0, N.C5, 0, 0, 0, N.E5,
+    // Bar 8
+    0, N.G4, 0, 0, 0, N.E4, 0, 0
+  ];
+
+  var TOTAL_STEPS = melody.length;
+
+  function getCtx() {
+    if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    if (!masterGain) {
+      masterGain = audioCtx.createGain();
+      masterGain.gain.value = 0.5;
+      masterGain.connect(audioCtx.destination);
+    }
+    return audioCtx;
+  }
+
+  function scheduleNote(freq, time, dur, type, vol) {
+    if (!freq || freq === 0) return;
+    var ac = getCtx();
+    var osc = ac.createOscillator();
+    var gain = ac.createGain();
+    osc.type = type || 'square';
+    osc.frequency.value = freq;
+    // Staccato envelope
+    var noteDur = dur * 0.7;
+    gain.gain.setValueAtTime(vol || 0.06, time);
+    gain.gain.setValueAtTime(vol || 0.06, time + noteDur * 0.8);
+    gain.gain.exponentialRampToValueAtTime(0.001, time + noteDur);
+    osc.connect(gain);
+    gain.connect(masterGain);
+    osc.start(time);
+    osc.stop(time + noteDur + 0.01);
+  }
+
+  function scheduleStep(step, time) {
+    var s = step % TOTAL_STEPS;
+    // Lead melody — square wave, slightly louder
+    scheduleNote(melody[s], time, STEP_DUR, 'square', 0.07);
+    // Bass — triangle wave
+    scheduleNote(bass[s], time, STEP_DUR * 1.8, 'triangle', 0.09);
+    // Harmony — quieter square wave, one octave effect
+    scheduleNote(harmony[s], time, STEP_DUR, 'square', 0.035);
+  }
+
+  function scheduler() {
+    if (!playing || paused) return;
+    var ac = getCtx();
+    // Schedule notes 100ms ahead for smooth playback
+    while (nextStepTime < ac.currentTime + 0.1) {
+      scheduleStep(currentStep, nextStepTime);
+      nextStepTime += STEP_DUR;
+      currentStep++;
+    }
+    timerID = setTimeout(scheduler, 25);
+  }
+
+  return {
+    start: function() {
+      var ac = getCtx();
+      if (ac.state === 'suspended') ac.resume();
+      playing = true;
+      paused = false;
+      currentStep = 0;
+      nextStepTime = ac.currentTime + 0.1;
+      scheduler();
+    },
+
+    stop: function() {
+      playing = false;
+      paused = false;
+      if (timerID) { clearTimeout(timerID); timerID = null; }
+    },
+
+    pause: function() {
+      if (!playing) return;
+      paused = true;
+      if (timerID) { clearTimeout(timerID); timerID = null; }
+    },
+
+    resume: function() {
+      if (!playing || !paused) return;
+      paused = false;
+      var ac = getCtx();
+      nextStepTime = ac.currentTime + 0.05;
+      scheduler();
+    },
+
+    setVolume: function(v) {
+      if (masterGain) masterGain.gain.value = v;
+    }
+  };
+})();
+
+
+// ============================================================
 // CANVAS SETUP & RESPONSIVE SIZING
 // ============================================================
 var canvas = document.getElementById('game');
@@ -884,6 +1060,7 @@ function update() {
         initGame();
         gameState = 'playing';
         overlay.classList.add('hidden');
+        MUSIC.start();
       }
     }
     return;
@@ -970,6 +1147,7 @@ function update() {
     p.vy = -5;
     deathTimer = 0;
     SFX.fall();
+    MUSIC.stop();
   }
 
   // Coins
@@ -1035,6 +1213,7 @@ function update() {
           p.vy = -5;
           deathTimer = 0;
           SFX.death();
+          MUSIC.stop();
         }
       }
     }
@@ -1049,6 +1228,7 @@ function update() {
       winTimer = 0;
       score += 1000;
       SFX.win();
+      MUSIC.stop();
     }
   }
 
@@ -1235,6 +1415,7 @@ function startGame() {
   gameState = 'playing';
   overlay.classList.add('hidden');
   SFX.menuClick();
+  MUSIC.start();
 }
 
 startBtn.addEventListener('click', startGame);
@@ -1273,8 +1454,10 @@ document.addEventListener('keydown', function(e) {
 
     if (window.isGamePaused) {
       SFX.pause();
+      MUSIC.pause();
     } else {
       SFX.unpause();
+      MUSIC.resume();
       lastTime = 0;
       accumulator = 0;
       if (pausedCallback) {
